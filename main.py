@@ -1,6 +1,7 @@
 """CanSat Ground Station: asynchronous serial, persistence, map and graph bridge."""
 from __future__ import annotations
 
+from email import header
 import json
 import math
 import queue
@@ -17,6 +18,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from PIL import Image
 from anomaly_detection import STATUS_ANOMALY, STATUS_INSUFFICIENT, STATUS_INVALID, STATUS_MONITORING, AnomalyDetector, DetectorConfig, load_config
 from database_handling import TelemetryDatabase
 from setup_map import FlightMap
@@ -194,20 +196,84 @@ class GroundStation(ctk.CTk):
     def _build_ui(self):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
+        
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(header, text="CanGii  |  CAN-7USAT Ground Station", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=18, pady=12, sticky="w")
+
+# Header layout
+        header.grid_columnconfigure(0, weight=0)
+        header.grid_columnconfigure(1, weight=1)
+
+# Load team logo
+        logo_path = APP_DIR / "assets" / "team_logo.jpeg"
+
+        if logo_path.is_file():
+            pil_logo = Image.open(logo_path).convert("RGBA")
+
+            self.logo_image = ctk.CTkImage(
+                light_image=pil_logo,
+                dark_image=pil_logo,
+                size=(44, 44)
+    )
+
+            ctk.CTkLabel(
+                header,
+                image=self.logo_image,
+                text=""
+            ).grid(
+                row=0, column=0,
+                padx=(18, 8), pady=8,
+                sticky="w"
+            )
+        else:
+            self.logo_image = None
+            print(f"Team logo not found: {logo_path}")
+
+# Team name and ground station title
+        ctk.CTkLabel(
+            header,
+            text="ASTRASENSE NEXUS | CAN-7-USAT Ground Station",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).grid(
+            row=0, column=1,
+            padx=8, pady=12,
+            sticky="w"
+        )
+
+
+# Status clocks
         self.uptime_var = tk.StringVar(value="Software 00:00:00")
         self.flight_var = tk.StringVar(value="Flight --:--:--")
         self.clock_var = tk.StringVar(value="UTC --:--:--")
-        for col, var in enumerate((self.uptime_var, self.flight_var, self.clock_var), 1):
-            ctk.CTkLabel(header, textvariable=var).grid(row=0, column=col, padx=9)
-        self.mode_switch = ctk.CTkSwitch(header, text="Light", command=lambda: ctk.set_appearance_mode("Light" if self.mode_switch.get() else "Dark"))
-        self.mode_switch.grid(row=0, column=4, padx=10)
-        self.scale_menu = ctk.CTkOptionMenu(header, values=["100%", "125%", "150%"], command=self._set_scale, width=90)
+
+        for col, var in enumerate(
+            (self.uptime_var, self.flight_var, self.clock_var), 2
+):
+            ctk.CTkLabel(
+                header,
+                textvariable=var
+            ).grid(row=0, column=col, padx=9)
+
+# Appearance switch
+        self.mode_switch = ctk.CTkSwitch(
+            header,
+            text="Light",
+            command=lambda: ctk.set_appearance_mode(
+                "Light" if self.mode_switch.get() else "Dark"
+    )
+)
+        self.mode_switch.grid(row=0, column=5, padx=10)
+
+# Scaling menu
+        self.scale_menu = ctk.CTkOptionMenu(
+            header,
+            values=["100%", "125%", "150%"],
+            command=self._set_scale,
+            width=90
+)
         self.scale_menu.set("100%")
-        self.scale_menu.grid(row=0, column=5, padx=(0, 14))
+        self.scale_menu.grid(row=0, column=6, padx=(0, 14))
+
 
         sidebar = ctk.CTkFrame(self, width=270)
         sidebar.grid(row=1, column=0, sticky="nsew", padx=(10, 5), pady=10)
