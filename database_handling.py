@@ -71,6 +71,11 @@ class TelemetryDatabase:
     def submit(self, record: dict[str, Any], timeout: float = 0.2) -> None:
         if self._closed:
             raise RuntimeError("Database is closed")
+        missing = [field for field in TELEMETRY_FIELDS if field not in record]
+        if missing:
+            raise ValueError("Telemetry record is missing required fields: " + ", ".join(missing))
+        if self._error:
+            raise RuntimeError(f"Database writer failed: {self._error}")
         self._queue.put(dict(record), timeout=timeout)
 
     def recent(self, limit: int = 100) -> list[dict[str, Any]]:

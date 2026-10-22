@@ -1,7 +1,6 @@
 """CanSat Ground Station: asynchronous serial, persistence, map and graph bridge."""
 from __future__ import annotations
 
-from email import header
 import json
 import math
 import queue
@@ -18,14 +17,15 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from PIL import Image
 from anomaly_detection import STATUS_ANOMALY, STATUS_INSUFFICIENT, STATUS_INVALID, STATUS_MONITORING, AnomalyDetector, DetectorConfig, load_config
 from database_handling import TelemetryDatabase
 from setup_map import FlightMap
 from station_control import STATE_NAMES, SerialSettings, TELEMETRY_FIELDS, available_ports, parse_frame
 from telemetry_graphs import GraphData, TelemetryGraphWindow
+from offline_navigation import calculate_navigation_instructions
 
 APP_DIR = Path(__file__).resolve().parent
+LOGO_PATH = APP_DIR / "team_logo.jpeg"
 GRAPH_SCRIPT = APP_DIR / "deploy_graph.py"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 GRAPH_HOST, GRAPH_PORT = "127.0.0.1", 5555
@@ -106,6 +106,7 @@ class SerialWorker:
         self.settings, self.output, self.log = settings, output, log
         self.stop_event = threading.Event()
         self.serial = None
+        self.write_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name="serial-reader", daemon=True)
 
     def start(self):
@@ -143,8 +144,9 @@ class SerialWorker:
     def send(self, command: str) -> None:
         if not self.serial or not self.serial.is_open:
             raise RuntimeError("Serial port is not connected")
-        self.serial.write((command + "\r\n").encode("ascii"))
-        self.serial.flush()
+        with self.write_lock:
+            self.serial.write((command + "\r\n").encode("ascii"))
+            self.serial.flush()
 
     def stop(self):
         self.stop_event.set()
@@ -156,10 +158,51 @@ class SerialWorker:
         self.thread.join(2)
 
 
+class SimulationWorker:
+    """Generate schema-valid synthetic frames locally; never transmits over RF."""
+    def __init__(self, output: queue.Queue):
+        self.output = output
+        self.stop_event = threading.Event()
+        self.transmitting = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="telemetry-simulation", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def command(self, command: str):
+        if command == "CMD,START_TM": self.transmitting.set()
+        elif command == "CMD,STOP_TM": self.transmitting.clear()
+
+    def _run(self):
+        packet = 0
+        while not self.stop_event.wait(1.0):
+            if not self.transmitting.is_set():
+                continue
+            packet += 1
+            state = 7 if packet >= 60 else (3 if packet >= 10 else 2)
+            values = {
+                "TEAM_ID": "SIM-0001", "TIMESTAMP": f"{time.time():.3f}", "PACKET_COUNT": str(packet),
+                "ALTITUDE": f"{100 + min(packet, 60) * 2:.2f}", "PRESSURE": "100800", "TEMP": "22.5",
+                "VOLTAGE": "7.4", "GNSS_TIME": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "GNSS_LATITUDE": "12.97160", "GNSS_LONGITUDE": "77.59460", "GNSS_ALTITUDE": "920",
+                "GNSS_SATS": "9", "ACCEL_X": "0.1", "ACCEL_Y": "0.2", "ACCEL_Z": "9.7",
+                "GYRO_X": "0.01", "GYRO_Y": "0.02", "GYRO_Z": "0.01", "MAG_X": "20", "MAG_Y": "5", "MAG_Z": "40",
+                "ROLL": "1.2", "PITCH": "-0.8", "YAW": "42", "LIGHT_LUX": "350", "UV_INDEX": "2.1",
+                "HALL_RPM": "0", "FLIGHT_SOFTWARE_STATE": str(state), "REL_ALTITUDE": "0", "VERTICAL_SPEED": "0",
+                "GNSS_GROUND_SPEED": "0", "GNSS_COURSE": "42", "GNSS_HDOP": "0.9", "GNSS_FIX": "2",
+                "HUMIDITY": "45", "CURRENT": "320", "POWER": "2.368",
+            }
+            self.output.put(("frame", ",".join(values[field] for field in TELEMETRY_FIELDS)))
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(2)
+
+
 class GroundStation(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("CanGii | CanSat Ground Station")
+        self.title("AstrasenseNexus | CanSat Ground Station")
         self.geometry("1440x900")
         self.minsize(1100, 720)
         ctk.set_appearance_mode("Dark")
@@ -169,6 +212,8 @@ class GroundStation(ctk.CTk):
         self.db = TelemetryDatabase()
         self.broadcaster = SocketBroadcaster()
         self.serial_worker: SerialWorker | None = None
+        self.simulation_worker: SimulationWorker | None = None
+        self.landing_coordinates: tuple[float, float] | None = None
         self.graph_process: subprocess.Popen | None = None
         self.inbox: queue.Queue = queue.Queue(maxsize=2000)
         self.log_queue: queue.Queue = queue.Queue(maxsize=1000)
@@ -196,84 +241,30 @@ class GroundStation(ctk.CTk):
     def _build_ui(self):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
-        
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
-
-# Header layout
-        header.grid_columnconfigure(0, weight=0)
-        header.grid_columnconfigure(1, weight=1)
-
-# Load team logo
-        logo_path = APP_DIR / "assets" / "team_logo.jpeg"
-
-        if logo_path.is_file():
-            pil_logo = Image.open(logo_path).convert("RGBA")
-
-            self.logo_image = ctk.CTkImage(
-                light_image=pil_logo,
-                dark_image=pil_logo,
-                size=(44, 44)
-    )
-
-            ctk.CTkLabel(
-                header,
-                image=self.logo_image,
-                text=""
-            ).grid(
-                row=0, column=0,
-                padx=(18, 8), pady=8,
-                sticky="w"
-            )
-        else:
-            self.logo_image = None
-            print(f"Team logo not found: {logo_path}")
-
-# Team name and ground station title
-        ctk.CTkLabel(
-            header,
-            text="ASTRASENSE NEXUS | CAN-7-USAT Ground Station",
-            font=ctk.CTkFont(size=20, weight="bold")
-        ).grid(
-            row=0, column=1,
-            padx=8, pady=12,
-            sticky="w"
-        )
-
-
-# Status clocks
+        header.grid_columnconfigure(0, weight=1)
+        logo = None
+        if LOGO_PATH.is_file():
+            try:
+                from PIL import Image
+                with Image.open(LOGO_PATH) as source:
+                    logo_image = source.convert("RGB")
+                logo = ctk.CTkImage(light_image=logo_image, dark_image=logo_image, size=(48, 48))
+                self.logo_image = logo
+            except Exception as exc:
+                self._startup_notes.append(f"Team logo unavailable: {exc}")
+        ctk.CTkLabel(header, text="AstrasenseNexus  |  CAN-7USAT Ground Station", image=logo, compound="left", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=18, pady=8, sticky="w")
         self.uptime_var = tk.StringVar(value="Software 00:00:00")
         self.flight_var = tk.StringVar(value="Flight --:--:--")
         self.clock_var = tk.StringVar(value="UTC --:--:--")
-
-        for col, var in enumerate(
-            (self.uptime_var, self.flight_var, self.clock_var), 2
-):
-            ctk.CTkLabel(
-                header,
-                textvariable=var
-            ).grid(row=0, column=col, padx=9)
-
-# Appearance switch
-        self.mode_switch = ctk.CTkSwitch(
-            header,
-            text="Light",
-            command=lambda: ctk.set_appearance_mode(
-                "Light" if self.mode_switch.get() else "Dark"
-    )
-)
-        self.mode_switch.grid(row=0, column=5, padx=10)
-
-# Scaling menu
-        self.scale_menu = ctk.CTkOptionMenu(
-            header,
-            values=["100%", "125%", "150%"],
-            command=self._set_scale,
-            width=90
-)
+        for col, var in enumerate((self.uptime_var, self.flight_var, self.clock_var), 1):
+            ctk.CTkLabel(header, textvariable=var).grid(row=0, column=col, padx=9)
+        self.mode_switch = ctk.CTkSwitch(header, text="Light", command=lambda: ctk.set_appearance_mode("Light" if self.mode_switch.get() else "Dark"))
+        self.mode_switch.grid(row=0, column=4, padx=10)
+        self.scale_menu = ctk.CTkOptionMenu(header, values=["100%", "125%", "150%"], command=self._set_scale, width=90)
         self.scale_menu.set("100%")
-        self.scale_menu.grid(row=0, column=6, padx=(0, 14))
-
+        self.scale_menu.grid(row=0, column=5, padx=(0, 14))
 
         sidebar = ctk.CTkFrame(self, width=270)
         sidebar.grid(row=1, column=0, sticky="nsew", padx=(10, 5), pady=10)
@@ -287,19 +278,22 @@ class GroundStation(ctk.CTk):
         self.connect_button = ctk.CTkButton(sidebar, text="Connect", command=self._toggle_connection)
         self.connect_button.grid(row=3, column=0, padx=12, pady=8, sticky="ew")
         ctk.CTkLabel(sidebar, text="Telecommands", font=ctk.CTkFont(size=16, weight="bold")).grid(row=4, column=0, padx=12, pady=(16, 4), sticky="w")
-        for row, (label, command) in enumerate((("Start Telemetry", "CMD,START_TM"), ("Calibration 1", "CMD,CALIB_1"), ("Calibration 2", "CMD,CALIB_2"), ("Save EEPROM", "CMD,WRITE_EEPROM")), 5):
+        for row, (label, command) in enumerate((("Start Telemetry", "CMD,START_TM"), ("Stop Telemetry", "CMD,STOP_TM"), ("Calibration 1", "CMD,CALIB_1"), ("Calibration 2", "CMD,CALIB_2"), ("Save EEPROM", "CMD,WRITE_EEPROM")), 5):
             ctk.CTkButton(sidebar, text=label, command=lambda cmd=command: self._dispatch(cmd)).grid(row=row, column=0, padx=12, pady=4, sticky="ew")
-        ctk.CTkButton(sidebar, text="Export CSV", command=self._export_csv).grid(row=9, column=0, padx=12, pady=(12, 4), sticky="ew")
-        ctk.CTkLabel(sidebar, text="Live Log", font=ctk.CTkFont(size=16, weight="bold")).grid(row=10, column=0, padx=12, pady=(12, 4), sticky="w")
+        self.sim_switch = ctk.CTkSwitch(sidebar, text="Simulation Mode", command=self._toggle_simulation)
+        self.sim_switch.grid(row=10, column=0, padx=12, pady=(12, 4), sticky="w")
+        ctk.CTkButton(sidebar, text="Export CSV", command=self._export_csv).grid(row=11, column=0, padx=12, pady=4, sticky="ew")
+        ctk.CTkLabel(sidebar, text="Live Log", font=ctk.CTkFont(size=16, weight="bold")).grid(row=12, column=0, padx=12, pady=(12, 4), sticky="w")
         self.log_box = ctk.CTkTextbox(sidebar, height=270, wrap="word")
-        self.log_box.grid(row=11, column=0, padx=12, pady=(0, 12), sticky="nsew")
-        sidebar.grid_rowconfigure(11, weight=1)
+        self.log_box.grid(row=13, column=0, padx=12, pady=(0, 12), sticky="nsew")
+        sidebar.grid_rowconfigure(13, weight=1)
 
         self.tabs = ctk.CTkTabview(self)
         self.tabs.grid(row=1, column=1, sticky="nsew", padx=(5, 10), pady=10)
         overview = self.tabs.add("Overview")
         imu = self.tabs.add("IMU & Kinematics")
         nav = self.tabs.add("GNSS & Environment")
+        recovery = self.tabs.add("Recovery")
         logtab = self.tabs.add("Flight Log")
         anomaly_tab = self.tabs.add("Anomaly Detection")
         self._make_card_grid(overview, [
@@ -314,6 +308,7 @@ class GroundStation(ctk.CTk):
         nav.grid_rowconfigure(4, weight=1)
         nav.grid_columnconfigure((0, 1, 2), weight=1)
         self.flight_map = FlightMap(map_frame, height=300)
+        self._build_recovery_tab(recovery)
         self.table = ctk.CTkTextbox(logtab, wrap="none")
         self.table.pack(fill="both", expand=True, padx=8, pady=8)
         self._build_anomaly_tab(anomaly_tab)
@@ -344,6 +339,9 @@ class GroundStation(ctk.CTk):
         self.after(3000, self._refresh_ports)
 
     def _toggle_connection(self):
+        if self.simulation_worker:
+            messagebox.showinfo("Simulation active", "Disable Simulation Mode before connecting to a serial port.")
+            return
         if self.serial_worker:
             self.serial_worker.stop()
             self.serial_worker = None
@@ -370,6 +368,10 @@ class GroundStation(ctk.CTk):
             self._log(f"Could not launch graph window: {exc}")
 
     def _dispatch(self, command: str):
+        if self.simulation_worker:
+            self.simulation_worker.command(command)
+            self._log(f"SIM > {command}")
+            return
         if not self.serial_worker:
             self._log(f"Command not sent; serial disconnected: {command}")
             return
@@ -382,6 +384,49 @@ class GroundStation(ctk.CTk):
                     self.altitude_baseline = latest
         except Exception as exc:
             self._log(f"Command failed: {exc}")
+
+    def _toggle_simulation(self):
+        if self.sim_switch.get():
+            if self.serial_worker:
+                self.sim_switch.deselect()
+                self._log("Disable serial connection before simulation")
+                return
+            self.simulation_worker = SimulationWorker(self.inbox)
+            self.simulation_worker.start()
+            self.connect_button.configure(state="disabled")
+            self._log("Simulation enabled. Use Start Telemetry to generate local frames.")
+        elif self.simulation_worker:
+            self.simulation_worker.stop()
+            self.simulation_worker = None
+            self.connect_button.configure(state="normal")
+            self._log("Simulation disabled")
+
+    def _build_recovery_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(parent, text="CanSat recovery guidance", font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, padx=16, pady=(18, 8), sticky="w")
+        self.landing_var = tk.StringVar(value="Landing coordinates are not locked until IMPACT (state 7).")
+        ctk.CTkLabel(parent, textvariable=self.landing_var, wraplength=800, justify="left").grid(row=1, column=0, padx=16, pady=8, sticky="w")
+        inputs = ctk.CTkFrame(parent)
+        inputs.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
+        self.user_lat_entry = ctk.CTkEntry(inputs, placeholder_text="Your latitude")
+        self.user_lon_entry = ctk.CTkEntry(inputs, placeholder_text="Your longitude")
+        self.heading_entry = ctk.CTkEntry(inputs, placeholder_text="Heading ° (clockwise from north)")
+        for i, entry in enumerate((self.user_lat_entry, self.user_lon_entry, self.heading_entry)):
+            entry.grid(row=0, column=i, padx=6, pady=8, sticky="ew")
+            inputs.grid_columnconfigure(i, weight=1)
+        ctk.CTkButton(inputs, text="Get Directions", command=self._update_navigation).grid(row=1, column=0, columnspan=3, padx=6, pady=(0, 8), sticky="ew")
+        self.recovery_var = tk.StringVar(value="Enter your position and heading after landing coordinates are available.")
+        ctk.CTkLabel(parent, textvariable=self.recovery_var, font=ctk.CTkFont(size=19, weight="bold"), wraplength=800, justify="left").grid(row=3, column=0, padx=16, pady=16, sticky="w")
+
+    def _update_navigation(self):
+        if not self.landing_coordinates:
+            self.recovery_var.set("Waiting for locked IMPACT coordinates.")
+            return
+        try:
+            result = calculate_navigation_instructions(self.user_lat_entry.get(), self.user_lon_entry.get(), self.heading_entry.get(), *self.landing_coordinates)
+            self.recovery_var.set(f"{result['instruction']}\nDistance: {result['distance']:.1f} m  |  Bearing: {result['bearing']:.1f}°")
+        except (ValueError, TypeError) as exc:
+            self.recovery_var.set(f"Check your latitude, longitude, and heading: {exc}")
 
     def _process_record(self, record: dict):
         raw_record = dict(record)  # untouched wire values for the read-only anomaly detector
@@ -417,6 +462,13 @@ class GroundStation(ctk.CTk):
             self.last_packet = packet
             if self.flight_started_at is None and int(record["FLIGHT_SOFTWARE_STATE"]) >= 2:
                 self.flight_started_at = time.monotonic()
+            if int(record["FLIGHT_SOFTWARE_STATE"]) == 7 and self.landing_coordinates is None:
+                if int(record["GNSS_FIX"]) > 0:
+                    self.landing_coordinates = (float(record["GNSS_LATITUDE"]), float(record["GNSS_LONGITUDE"]))
+                    self.landing_var.set(f"IMPACT coordinates locked: {self.landing_coordinates[0]:.6f}, {self.landing_coordinates[1]:.6f}")
+                    self._update_navigation()
+                else:
+                    self.landing_var.set("IMPACT received, but GNSS fix is unavailable; waiting for a valid fix.")
             self.db.submit(record)
             self.broadcaster.publish(record)
             self._run_anomaly_detection(raw_record)
@@ -593,6 +645,8 @@ class GroundStation(ctk.CTk):
     def _close(self):
         if self.serial_worker:
             self.serial_worker.stop()
+        if self.simulation_worker:
+            self.simulation_worker.stop()
         if self.graph_process and self.graph_process.poll() is None:
             self.graph_process.terminate()
         self.broadcaster.close()

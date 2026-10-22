@@ -79,7 +79,7 @@ class TelemetryGraphWindow:
         self._closed = False
         self._drawn_revision = -1
         self.top = tk.Toplevel(master)
-        self.top.title("CanSat Telemetry Graphs")
+        self.top.title("AstrasenseNexus | CanSat Telemetry Graphs")
         self.top.geometry("1100x720")
         self.top.configure(bg=BACKGROUND)
         figure = Figure(figsize=(11, 7), dpi=100, facecolor=BACKGROUND, layout="constrained")

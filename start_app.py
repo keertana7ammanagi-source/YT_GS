@@ -6,12 +6,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-REQUIRED = {"customtkinter": "customtkinter", "serial": "pyserial", "matplotlib": "matplotlib", "tkintermapview": "tkintermapview"}
+REQUIRED = {"customtkinter": "customtkinter", "serial": "pyserial", "matplotlib": "matplotlib", "tkintermapview": "tkintermapview", "PIL": "Pillow"}
 
 
 def main() -> int:
     if sys.version_info < (3, 10):
-        print("CanSat Ground Station requires Python 3.10 or newer.", file=sys.stderr)
+        print("AstrasenseNexus Ground Station requires Python 3.10 or newer.", file=sys.stderr)
         return 2
     missing = [package for module, package in REQUIRED.items() if importlib.util.find_spec(module) is None]
     if missing:

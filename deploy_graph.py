@@ -23,7 +23,7 @@ COLORS = ("#55c2ff", "#ffb454", "#74d99f")
 class GraphClient:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("CanSat Telemetry Graphs")
+        self.root.title("AstrasenseNexus | CanSat Telemetry Graphs")
         self.root.geometry("1050x760")
         self.data = {name: {field: deque(maxlen=300) for field in fields} for name, fields in CHARTS}
         self.incoming: queue.Queue[dict] = queue.Queue(maxsize=2000)
