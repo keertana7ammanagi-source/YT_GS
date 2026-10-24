@@ -5,6 +5,7 @@ import csv
 import queue
 import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -71,11 +72,6 @@ class TelemetryDatabase:
     def submit(self, record: dict[str, Any], timeout: float = 0.2) -> None:
         if self._closed:
             raise RuntimeError("Database is closed")
-        missing = [field for field in TELEMETRY_FIELDS if field not in record]
-        if missing:
-            raise ValueError("Telemetry record is missing required fields: " + ", ".join(missing))
-        if self._error:
-            raise RuntimeError(f"Database writer failed: {self._error}")
         self._queue.put(dict(record), timeout=timeout)
 
     def recent(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -83,6 +79,28 @@ class TelemetryDatabase:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT * FROM telemetry ORDER BY id DESC LIMIT ?", (max(1, min(limit, 1000)),)).fetchall()
             return [dict(row) for row in reversed(rows)]
+
+    def last_id(self) -> int:
+        """Highest stored row id (0 when empty).  Read-only; used to mark where this session's rows begin."""
+        with closing(sqlite3.connect(self.path, timeout=3)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            return int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM telemetry").fetchone()[0])
+
+    def history(self, since_id: int = 0, columns: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """Read-only: rows with id > since_id in insertion order (values are stored as text).
+
+        Unlike recent() this is not capped at 1000 rows.  Only known column names are accepted.
+        """
+        allowed = {"id", "received_utc", *TELEMETRY_FIELDS}
+        chosen = ["id", "received_utc", *TELEMETRY_FIELDS] if columns is None else ["id", *[c for c in columns if c != "id"]]
+        unknown = [c for c in chosen if c not in allowed]
+        if unknown:
+            raise ValueError(f"Unknown telemetry columns: {unknown}")
+        sql = "SELECT " + ",".join(f'"{c}"' for c in chosen) + " FROM telemetry WHERE id > ? ORDER BY id"
+        with closing(sqlite3.connect(self.path, timeout=10)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            conn.row_factory = sqlite3.Row
+            return [dict(row) for row in conn.execute(sql, (int(since_id),))]
 
     def export_csv(self, destination: str | Path) -> Path:
         target = Path(destination)

@@ -18,20 +18,24 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from anomaly_detection import STATUS_ANOMALY, STATUS_INSUFFICIENT, STATUS_INVALID, STATUS_MONITORING, AnomalyDetector, DetectorConfig, load_config
+from ai_report import AnomalySnapshot, ReportInputs, generate_report, snapshot_anomaly_detector
 from database_handling import TelemetryDatabase
+from environmental_fingerprinting import REQUIRED_COLUMNS, FingerprintResult, analyze_environment, failed_result, format_fingerprint_text
+from environmental_fingerprinting import STATUS_COMPLETE as FP_COMPLETE, STATUS_INSUFFICIENT as FP_INSUFFICIENT  # not the anomaly STATUS_* names
 from setup_map import FlightMap
 from station_control import STATE_NAMES, SerialSettings, TELEMETRY_FIELDS, available_ports, parse_frame
 from telemetry_graphs import GraphData, TelemetryGraphWindow
-from offline_navigation import calculate_navigation_instructions
 
 APP_DIR = Path(__file__).resolve().parent
-LOGO_PATH = APP_DIR / "team_logo.jpeg"
 GRAPH_SCRIPT = APP_DIR / "deploy_graph.py"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 GRAPH_HOST, GRAPH_PORT = "127.0.0.1", 5555
 ANOMALY_CONFIG_PATH = APP_DIR / "anomaly_config.json"  # optional; see ANOMALY_DETECTION.md
 ANOMALY_STATUS_COLORS = {STATUS_MONITORING: "#2fa572", STATUS_ANOMALY: "#ff9f1a", STATUS_INSUFFICIENT: "#9aa6b2", STATUS_INVALID: "#e5484d"}
 ANOMALY_MAX_LINES = 500
+SCOPE_SESSION, SCOPE_ALL = "This session", "All stored data"
+FP_STATUS_COLORS = {"Waiting for sufficient telemetry": "#9aa6b2", "Ready: press Run / Refresh": "#9aa6b2", "Analysis in progress": "#ff9f1a",
+                    "Analysis complete": "#2fa572", "Insufficient valid data": "#e5b800", "Analysis failed": "#e5484d"}
 
 
 class SocketBroadcaster:
@@ -106,7 +110,6 @@ class SerialWorker:
         self.settings, self.output, self.log = settings, output, log
         self.stop_event = threading.Event()
         self.serial = None
-        self.write_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name="serial-reader", daemon=True)
 
     def start(self):
@@ -144,9 +147,8 @@ class SerialWorker:
     def send(self, command: str) -> None:
         if not self.serial or not self.serial.is_open:
             raise RuntimeError("Serial port is not connected")
-        with self.write_lock:
-            self.serial.write((command + "\r\n").encode("ascii"))
-            self.serial.flush()
+        self.serial.write((command + "\r\n").encode("ascii"))
+        self.serial.flush()
 
     def stop(self):
         self.stop_event.set()
@@ -158,51 +160,10 @@ class SerialWorker:
         self.thread.join(2)
 
 
-class SimulationWorker:
-    """Generate schema-valid synthetic frames locally; never transmits over RF."""
-    def __init__(self, output: queue.Queue):
-        self.output = output
-        self.stop_event = threading.Event()
-        self.transmitting = threading.Event()
-        self.thread = threading.Thread(target=self._run, name="telemetry-simulation", daemon=True)
-
-    def start(self):
-        self.thread.start()
-
-    def command(self, command: str):
-        if command == "CMD,START_TM": self.transmitting.set()
-        elif command == "CMD,STOP_TM": self.transmitting.clear()
-
-    def _run(self):
-        packet = 0
-        while not self.stop_event.wait(1.0):
-            if not self.transmitting.is_set():
-                continue
-            packet += 1
-            state = 7 if packet >= 60 else (3 if packet >= 10 else 2)
-            values = {
-                "TEAM_ID": "SIM-0001", "TIMESTAMP": f"{time.time():.3f}", "PACKET_COUNT": str(packet),
-                "ALTITUDE": f"{100 + min(packet, 60) * 2:.2f}", "PRESSURE": "100800", "TEMP": "22.5",
-                "VOLTAGE": "7.4", "GNSS_TIME": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "GNSS_LATITUDE": "12.97160", "GNSS_LONGITUDE": "77.59460", "GNSS_ALTITUDE": "920",
-                "GNSS_SATS": "9", "ACCEL_X": "0.1", "ACCEL_Y": "0.2", "ACCEL_Z": "9.7",
-                "GYRO_X": "0.01", "GYRO_Y": "0.02", "GYRO_Z": "0.01", "MAG_X": "20", "MAG_Y": "5", "MAG_Z": "40",
-                "ROLL": "1.2", "PITCH": "-0.8", "YAW": "42", "LIGHT_LUX": "350", "UV_INDEX": "2.1",
-                "HALL_RPM": "0", "FLIGHT_SOFTWARE_STATE": str(state), "REL_ALTITUDE": "0", "VERTICAL_SPEED": "0",
-                "GNSS_GROUND_SPEED": "0", "GNSS_COURSE": "42", "GNSS_HDOP": "0.9", "GNSS_FIX": "2",
-                "HUMIDITY": "45", "CURRENT": "320", "POWER": "2.368",
-            }
-            self.output.put(("frame", ",".join(values[field] for field in TELEMETRY_FIELDS)))
-
-    def stop(self):
-        self.stop_event.set()
-        self.thread.join(2)
-
-
 class GroundStation(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("AstrasenseNexus | CanSat Ground Station")
+        self.title("CanGii | CanSat Ground Station")
         self.geometry("1440x900")
         self.minsize(1100, 720)
         ctk.set_appearance_mode("Dark")
@@ -212,8 +173,6 @@ class GroundStation(ctk.CTk):
         self.db = TelemetryDatabase()
         self.broadcaster = SocketBroadcaster()
         self.serial_worker: SerialWorker | None = None
-        self.simulation_worker: SimulationWorker | None = None
-        self.landing_coordinates: tuple[float, float] | None = None
         self.graph_process: subprocess.Popen | None = None
         self.inbox: queue.Queue = queue.Queue(maxsize=2000)
         self.log_queue: queue.Queue = queue.Queue(maxsize=1000)
@@ -230,6 +189,12 @@ class GroundStation(ctk.CTk):
         self.graph_data = GraphData()
         self.graph_window: TelemetryGraphWindow | None = None
         self._startup_notes: list[str] = []
+        self.ai_queue: queue.Queue = queue.Queue()      # worker threads -> Tk thread (polled with after())
+        self.fingerprint_result: FingerprintResult | None = None
+        self._fingerprint_running = False
+        self._report_running = False
+        self._pending_report: dict | None = None
+        self.session_start_id = self._read_session_start_id()
         self.anomaly_detector = self._create_anomaly_detector()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -237,6 +202,7 @@ class GroundStation(ctk.CTk):
         self.after(250, self._tick_clocks)
         self.after(1000, self._refresh_ports)
         self.after(1500, self._refresh_table)
+        self.after(300, self._poll_ai_queue)
 
     def _build_ui(self):
         self.grid_columnconfigure(1, weight=1)
@@ -244,17 +210,7 @@ class GroundStation(ctk.CTk):
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
         header.grid_columnconfigure(0, weight=1)
-        logo = None
-        if LOGO_PATH.is_file():
-            try:
-                from PIL import Image
-                with Image.open(LOGO_PATH) as source:
-                    logo_image = source.convert("RGB")
-                logo = ctk.CTkImage(light_image=logo_image, dark_image=logo_image, size=(48, 48))
-                self.logo_image = logo
-            except Exception as exc:
-                self._startup_notes.append(f"Team logo unavailable: {exc}")
-        ctk.CTkLabel(header, text="AstrasenseNexus  |  CAN-7USAT Ground Station", image=logo, compound="left", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=18, pady=8, sticky="w")
+        ctk.CTkLabel(header, text="CanGii  |  CAN-7USAT Ground Station", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=18, pady=12, sticky="w")
         self.uptime_var = tk.StringVar(value="Software 00:00:00")
         self.flight_var = tk.StringVar(value="Flight --:--:--")
         self.clock_var = tk.StringVar(value="UTC --:--:--")
@@ -278,13 +234,14 @@ class GroundStation(ctk.CTk):
         self.connect_button = ctk.CTkButton(sidebar, text="Connect", command=self._toggle_connection)
         self.connect_button.grid(row=3, column=0, padx=12, pady=8, sticky="ew")
         ctk.CTkLabel(sidebar, text="Telecommands", font=ctk.CTkFont(size=16, weight="bold")).grid(row=4, column=0, padx=12, pady=(16, 4), sticky="w")
-        for row, (label, command) in enumerate((("Start Telemetry", "CMD,START_TM"), ("Stop Telemetry", "CMD,STOP_TM"), ("Calibration 1", "CMD,CALIB_1"), ("Calibration 2", "CMD,CALIB_2"), ("Save EEPROM", "CMD,WRITE_EEPROM")), 5):
+        for row, (label, command) in enumerate((("Start Telemetry", "CMD,START_TM"), ("Calibration 1", "CMD,CALIB_1"), ("Calibration 2", "CMD,CALIB_2"), ("Save EEPROM", "CMD,WRITE_EEPROM")), 5):
             ctk.CTkButton(sidebar, text=label, command=lambda cmd=command: self._dispatch(cmd)).grid(row=row, column=0, padx=12, pady=4, sticky="ew")
-        self.sim_switch = ctk.CTkSwitch(sidebar, text="Simulation Mode", command=self._toggle_simulation)
-        self.sim_switch.grid(row=10, column=0, padx=12, pady=(12, 4), sticky="w")
-        ctk.CTkButton(sidebar, text="Export CSV", command=self._export_csv).grid(row=11, column=0, padx=12, pady=4, sticky="ew")
+        ctk.CTkButton(sidebar, text="Export CSV", command=self._export_csv).grid(row=9, column=0, padx=12, pady=(12, 4), sticky="ew")
+        ctk.CTkLabel(sidebar, text="AI Analysis / Reports", font=ctk.CTkFont(size=16, weight="bold")).grid(row=10, column=0, padx=12, pady=(12, 4), sticky="w")
+        self.report_button = ctk.CTkButton(sidebar, text="Generate AI Mission Report (PDF)", command=self._generate_report, fg_color="#E67E22", hover_color="#CF6D17", text_color="white")
+        self.report_button.grid(row=11, column=0, padx=12, pady=4, sticky="ew")
         ctk.CTkLabel(sidebar, text="Live Log", font=ctk.CTkFont(size=16, weight="bold")).grid(row=12, column=0, padx=12, pady=(12, 4), sticky="w")
-        self.log_box = ctk.CTkTextbox(sidebar, height=270, wrap="word")
+        self.log_box = ctk.CTkTextbox(sidebar, height=190, wrap="word")
         self.log_box.grid(row=13, column=0, padx=12, pady=(0, 12), sticky="nsew")
         sidebar.grid_rowconfigure(13, weight=1)
 
@@ -293,9 +250,9 @@ class GroundStation(ctk.CTk):
         overview = self.tabs.add("Overview")
         imu = self.tabs.add("IMU & Kinematics")
         nav = self.tabs.add("GNSS & Environment")
-        recovery = self.tabs.add("Recovery")
         logtab = self.tabs.add("Flight Log")
         anomaly_tab = self.tabs.add("Anomaly Detection")
+        fingerprint_tab = self.tabs.add("Environmental Fingerprinting")
         self._make_card_grid(overview, [
             ("Flight State", "STATE"), ("Packets / Lost", "PACKETS"), ("Loss", "LOSS"),
             ("Relative Altitude (m)", "REL_ALTITUDE"), ("Barometric Altitude (m)", "ALTITUDE"), ("Vertical Speed (m/s)", "VERTICAL_SPEED"),
@@ -308,10 +265,10 @@ class GroundStation(ctk.CTk):
         nav.grid_rowconfigure(4, weight=1)
         nav.grid_columnconfigure((0, 1, 2), weight=1)
         self.flight_map = FlightMap(map_frame, height=300)
-        self._build_recovery_tab(recovery)
         self.table = ctk.CTkTextbox(logtab, wrap="none")
         self.table.pack(fill="both", expand=True, padx=8, pady=8)
         self._build_anomaly_tab(anomaly_tab)
+        self._build_fingerprint_tab(fingerprint_tab)
         for note in self._startup_notes:
             self._log(note)
         self._open_graph_window()
@@ -339,9 +296,6 @@ class GroundStation(ctk.CTk):
         self.after(3000, self._refresh_ports)
 
     def _toggle_connection(self):
-        if self.simulation_worker:
-            messagebox.showinfo("Simulation active", "Disable Simulation Mode before connecting to a serial port.")
-            return
         if self.serial_worker:
             self.serial_worker.stop()
             self.serial_worker = None
@@ -368,10 +322,6 @@ class GroundStation(ctk.CTk):
             self._log(f"Could not launch graph window: {exc}")
 
     def _dispatch(self, command: str):
-        if self.simulation_worker:
-            self.simulation_worker.command(command)
-            self._log(f"SIM > {command}")
-            return
         if not self.serial_worker:
             self._log(f"Command not sent; serial disconnected: {command}")
             return
@@ -384,49 +334,6 @@ class GroundStation(ctk.CTk):
                     self.altitude_baseline = latest
         except Exception as exc:
             self._log(f"Command failed: {exc}")
-
-    def _toggle_simulation(self):
-        if self.sim_switch.get():
-            if self.serial_worker:
-                self.sim_switch.deselect()
-                self._log("Disable serial connection before simulation")
-                return
-            self.simulation_worker = SimulationWorker(self.inbox)
-            self.simulation_worker.start()
-            self.connect_button.configure(state="disabled")
-            self._log("Simulation enabled. Use Start Telemetry to generate local frames.")
-        elif self.simulation_worker:
-            self.simulation_worker.stop()
-            self.simulation_worker = None
-            self.connect_button.configure(state="normal")
-            self._log("Simulation disabled")
-
-    def _build_recovery_tab(self, parent):
-        parent.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(parent, text="CanSat recovery guidance", font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, padx=16, pady=(18, 8), sticky="w")
-        self.landing_var = tk.StringVar(value="Landing coordinates are not locked until IMPACT (state 7).")
-        ctk.CTkLabel(parent, textvariable=self.landing_var, wraplength=800, justify="left").grid(row=1, column=0, padx=16, pady=8, sticky="w")
-        inputs = ctk.CTkFrame(parent)
-        inputs.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
-        self.user_lat_entry = ctk.CTkEntry(inputs, placeholder_text="Your latitude")
-        self.user_lon_entry = ctk.CTkEntry(inputs, placeholder_text="Your longitude")
-        self.heading_entry = ctk.CTkEntry(inputs, placeholder_text="Heading ° (clockwise from north)")
-        for i, entry in enumerate((self.user_lat_entry, self.user_lon_entry, self.heading_entry)):
-            entry.grid(row=0, column=i, padx=6, pady=8, sticky="ew")
-            inputs.grid_columnconfigure(i, weight=1)
-        ctk.CTkButton(inputs, text="Get Directions", command=self._update_navigation).grid(row=1, column=0, columnspan=3, padx=6, pady=(0, 8), sticky="ew")
-        self.recovery_var = tk.StringVar(value="Enter your position and heading after landing coordinates are available.")
-        ctk.CTkLabel(parent, textvariable=self.recovery_var, font=ctk.CTkFont(size=19, weight="bold"), wraplength=800, justify="left").grid(row=3, column=0, padx=16, pady=16, sticky="w")
-
-    def _update_navigation(self):
-        if not self.landing_coordinates:
-            self.recovery_var.set("Waiting for locked IMPACT coordinates.")
-            return
-        try:
-            result = calculate_navigation_instructions(self.user_lat_entry.get(), self.user_lon_entry.get(), self.heading_entry.get(), *self.landing_coordinates)
-            self.recovery_var.set(f"{result['instruction']}\nDistance: {result['distance']:.1f} m  |  Bearing: {result['bearing']:.1f}°")
-        except (ValueError, TypeError) as exc:
-            self.recovery_var.set(f"Check your latitude, longitude, and heading: {exc}")
 
     def _process_record(self, record: dict):
         raw_record = dict(record)  # untouched wire values for the read-only anomaly detector
@@ -462,13 +369,6 @@ class GroundStation(ctk.CTk):
             self.last_packet = packet
             if self.flight_started_at is None and int(record["FLIGHT_SOFTWARE_STATE"]) >= 2:
                 self.flight_started_at = time.monotonic()
-            if int(record["FLIGHT_SOFTWARE_STATE"]) == 7 and self.landing_coordinates is None:
-                if int(record["GNSS_FIX"]) > 0:
-                    self.landing_coordinates = (float(record["GNSS_LATITUDE"]), float(record["GNSS_LONGITUDE"]))
-                    self.landing_var.set(f"IMPACT coordinates locked: {self.landing_coordinates[0]:.6f}, {self.landing_coordinates[1]:.6f}")
-                    self._update_navigation()
-                else:
-                    self.landing_var.set("IMPACT received, but GNSS fix is unavailable; waiting for a valid fix.")
             self.db.submit(record)
             self.broadcaster.publish(record)
             self._run_anomaly_detection(raw_record)
@@ -478,6 +378,215 @@ class GroundStation(ctk.CTk):
             self._latest_altitude = altitude
         except Exception as exc:
             self._log(f"Frame processing error: {exc}")
+
+    # ---- environmental fingerprinting + combined AI report (offline and read-only: never transmits) ----
+    def _read_session_start_id(self) -> int:
+        try:
+            return self.db.last_id()
+        except Exception as exc:
+            self._startup_notes.append(f"Could not read database position ({exc}); 'This session' will include all stored rows.")
+            return 0
+
+    def _build_fingerprint_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
+        controls = ctk.CTkFrame(parent)
+        controls.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        self.fp_run_button = ctk.CTkButton(controls, text="Run / Refresh Fingerprinting", command=self._run_fingerprint)
+        self.fp_run_button.pack(side="left", padx=(10, 8), pady=8)
+        self.fp_scope_menu = ctk.CTkOptionMenu(controls, values=[SCOPE_SESSION, SCOPE_ALL], width=150)
+        self.fp_scope_menu.set(SCOPE_SESSION)
+        self.fp_scope_menu.pack(side="left", padx=4)
+        ctk.CTkLabel(controls, text="From t (s)").pack(side="left", padx=(12, 2))
+        self.fp_from_entry = ctk.CTkEntry(controls, width=70, placeholder_text="start")
+        self.fp_from_entry.pack(side="left")
+        ctk.CTkLabel(controls, text="To t (s)").pack(side="left", padx=(8, 2))
+        self.fp_to_entry = ctk.CTkEntry(controls, width=70, placeholder_text="end")
+        self.fp_to_entry.pack(side="left")
+        self.fp_status_var = tk.StringVar(value="Waiting for sufficient telemetry")
+        self.fp_status_label = ctk.CTkLabel(parent, textvariable=self.fp_status_var, anchor="w", font=ctk.CTkFont(size=18, weight="bold"), text_color=FP_STATUS_COLORS["Waiting for sufficient telemetry"])
+        self.fp_status_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 0))
+        self.fp_summary_var = tk.StringVar(value="Offline, unsupervised statistical analysis (K-means) of validated telemetry. Not a trained model; not validated on real flight data.")
+        ctk.CTkLabel(parent, textvariable=self.fp_summary_var, anchor="w", justify="left", wraplength=1000, text_color=("#52606d", "#9aa6b2")).grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 4))
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        body.grid_columnconfigure((0, 1), weight=1, uniform="fp")
+        body.grid_rowconfigure(0, weight=1)
+        self.fp_text = ctk.CTkTextbox(body, wrap="word", font=ctk.CTkFont(family="Courier New", size=12))
+        self.fp_text.grid(row=0, column=0, sticky="nsew", padx=(2, 4))
+        self.fp_text.insert("end", "Press 'Run / Refresh Fingerprinting' once enough telemetry has been received.\n")
+        self.fp_figure = self.fp_canvas = None
+        chart_frame = ctk.CTkFrame(body)
+        chart_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 2))
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+            from fingerprint_charts import clear_with_message
+            self.fp_figure = Figure(figsize=(6, 5), dpi=100, facecolor="white")
+            clear_with_message(self.fp_figure, "Charts appear after the analysis runs")
+            self.fp_canvas = FigureCanvasTkAgg(self.fp_figure, master=chart_frame)
+            self.fp_canvas.get_tk_widget().pack(fill="both", expand=True)
+        except Exception as exc:
+            ctk.CTkLabel(chart_frame, text=f"Charts unavailable: {exc}").pack(padx=10, pady=10)
+
+    @staticmethod
+    def _parse_optional_float(text: str) -> float | None:
+        text = (text or "").strip()
+        if not text:
+            return None
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError("not finite")
+        return value
+
+    def _set_fp_status(self, status: str, summary: str | None = None):
+        self.fp_status_var.set(status)
+        self.fp_status_label.configure(text_color=FP_STATUS_COLORS.get(status, "#9aa6b2"))
+        if summary is not None:
+            self.fp_summary_var.set(summary)
+
+    def _update_fingerprint_idle_status(self):
+        if self._fingerprint_running or self.fingerprint_result is not None:
+            return
+        wanted = "Ready: press Run / Refresh" if self.packet_count >= 10 else "Waiting for sufficient telemetry"
+        if self.fp_status_var.get() != wanted:
+            self._set_fp_status(wanted)
+
+    def _run_fingerprint(self):
+        """Run the offline analysis in a worker thread; the result returns through self.ai_queue."""
+        if self._fingerprint_running:
+            return
+        try:
+            t_start = self._parse_optional_float(self.fp_from_entry.get())
+            t_end = self._parse_optional_float(self.fp_to_entry.get())
+            if t_start is not None and t_end is not None and t_start > t_end:
+                raise ValueError("start after end")
+        except ValueError:
+            self._set_fp_status("Analysis failed", "The From/To interval must be empty or numbers (mission TIMESTAMP in seconds), with From <= To.")
+            return
+        session = self.fp_scope_menu.get() == SCOPE_SESSION
+        since_id = self.session_start_id if session else 0
+        scope = (SCOPE_SESSION + " (rows stored since the application started)") if session else (SCOPE_ALL + " (may contain several flights)")
+        source = ("Live serial telemetry received in this application session (validated frames stored in the telemetry database)" if session
+                  else "All rows in the telemetry database; the origin of rows stored in earlier runs is not recorded")
+        self._fingerprint_running = True
+        self.fp_run_button.configure(state="disabled")
+        self._set_fp_status("Analysis in progress", "Reading stored telemetry and analysing it in the background...")
+        threading.Thread(target=self._fingerprint_worker, name="fingerprint", daemon=True,
+                         args=(self.db, self.ai_queue, since_id, t_start, t_end, scope, source)).start()
+
+    @staticmethod
+    def _fingerprint_worker(db, out_queue, since_id, t_start, t_end, scope, source):
+        try:
+            rows = db.history(since_id, REQUIRED_COLUMNS)
+            result = analyze_environment(rows, None, t_start, t_end, scope, source)
+        except Exception as exc:  # never raise into the thread machinery; report as a failed analysis
+            result = failed_result(f"{type(exc).__name__}: {exc}", scope, source)
+        out_queue.put(("fingerprint", result))
+
+    def _poll_ai_queue(self):
+        try:
+            while True:
+                try:
+                    message = self.ai_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle_ai_message(message)
+            self._update_fingerprint_idle_status()
+        except Exception as exc:
+            try: self._log(f"AI analysis UI error (telemetry unaffected): {exc}")
+            except Exception: pass
+        try:
+            self.after(250, self._poll_ai_queue)
+        except Exception:
+            pass
+
+    def _handle_ai_message(self, message):
+        kind = message[0]
+        if kind == "fingerprint":
+            self._fingerprint_running = False
+            self.fp_run_button.configure(state="normal")
+            self.fingerprint_result = message[1]
+            self._show_fingerprint(message[1])
+            if self._pending_report is not None:
+                job, self._pending_report = self._pending_report, None
+                self._start_report(job)
+        elif kind == "report_ok":
+            self._report_running = False
+            self.report_button.configure(state="normal", text="Generate AI Mission Report (PDF)")
+            self._log(f"AI report saved: {message[1]}")
+            messagebox.showinfo("AI Mission Report", f"Report saved to:\n{message[1]}")
+        elif kind == "report_failed":
+            self._report_running = False
+            self.report_button.configure(state="normal", text="Generate AI Mission Report (PDF)")
+            self._log(f"AI report failed: {message[1]}")
+            messagebox.showerror("AI Mission Report", f"The report could not be created:\n{message[1]}")
+
+    def _show_fingerprint(self, result: FingerprintResult):
+        """Display a result; a failed analysis is never presented as a success."""
+        if result.status == FP_COMPLETE:
+            coverage = ", ".join(f"{s.label} {s.coverage:.0%}" for s in result.feature_stats)
+            self._set_fp_status("Analysis complete", f"{result.name}  |  {result.n_observations} observations ({result.n_complete} complete)  |  coverage: {coverage}")
+        elif result.status == FP_INSUFFICIENT:
+            self._set_fp_status("Insufficient valid data", result.message)
+        else:
+            self._set_fp_status("Analysis failed", result.message)
+        self._log(f"Fingerprinting: {result.message}")
+        self.fp_text.delete("1.0", "end")
+        self.fp_text.insert("end", format_fingerprint_text(result))
+        if self.fp_figure is not None:
+            try:
+                from fingerprint_charts import clear_with_message, draw_ui_overview
+                if result.status == FP_COMPLETE:
+                    draw_ui_overview(self.fp_figure, result)
+                else:
+                    clear_with_message(self.fp_figure, result.message)
+                self.fp_canvas.draw_idle()
+            except Exception as exc:
+                self._log(f"Fingerprint chart error (results are still shown as text): {exc}")
+
+    def _generate_report(self):
+        """Ask where to save, then build the combined PDF in a worker thread from the dashboard's own results."""
+        if self._report_running or self._pending_report is not None:
+            self._log("An AI report is already being generated")
+            return
+        team = self.last_team_id or "UNKNOWN"
+        suggested = f"CanSat_AI_Report_{team}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+        destination = filedialog.asksaveasfilename(defaultextension=".pdf", initialfile=suggested, filetypes=[("PDF files", "*.pdf")])
+        if not destination:
+            return
+        try:
+            snapshot = snapshot_anomaly_detector(self.anomaly_detector)
+        except Exception as exc:
+            snapshot = AnomalySnapshot(available=False, error=f"{type(exc).__name__}: {exc}")
+        job = {"path": destination, "anomaly": snapshot, "team": self.last_team_id}
+        if self._fingerprint_running:
+            self._pending_report = job
+            self._log("Report will be created when the running fingerprint analysis finishes")
+        elif self.fingerprint_result is None:
+            self._pending_report = job
+            self._run_fingerprint()                   # same code path as the dashboard button
+            if not self._fingerprint_running:         # e.g. invalid interval text: do not wait forever
+                self._pending_report = None
+                self._log("Report cancelled: fingerprint analysis could not start")
+        else:
+            self._start_report(job)
+
+    def _start_report(self, job: dict):
+        inputs = ReportInputs(fingerprint=self.fingerprint_result, anomaly=job["anomaly"], team_id=job["team"],
+                              data_source=self.fingerprint_result.data_source if self.fingerprint_result else "")
+        self._report_running = True
+        self.report_button.configure(state="disabled", text="Generating report...")
+        self._log(f"Generating AI report: {job['path']}")
+        threading.Thread(target=self._report_worker, name="ai-report", daemon=True, args=(self.ai_queue, job["path"], inputs)).start()
+
+    @staticmethod
+    def _report_worker(out_queue, path, inputs):
+        try:
+            written = generate_report(path, inputs)
+            out_queue.put(("report_ok", str(written)))
+        except Exception as exc:  # includes ImportError with the reportlab install hint
+            out_queue.put(("report_failed", f"{type(exc).__name__}: {exc}" if not isinstance(exc, ImportError) else str(exc)))
 
     # ---- six-graph telemetry window (read-only view of already-validated records) ----
     def _open_graph_window(self):
@@ -645,8 +754,6 @@ class GroundStation(ctk.CTk):
     def _close(self):
         if self.serial_worker:
             self.serial_worker.stop()
-        if self.simulation_worker:
-            self.simulation_worker.stop()
         if self.graph_process and self.graph_process.poll() is None:
             self.graph_process.terminate()
         self.broadcaster.close()
