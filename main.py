@@ -28,7 +28,7 @@ from telemetry_graphs import GraphData, TelemetryGraphWindow
 from offline_navigation import calculate_navigation_instructions
 
 APP_DIR = Path(__file__).resolve().parent
-LOGO_PATH = APP_DIR / "team_logo.jpeg"
+LOGO_PATH = Path(r"C:\Users\Keertana M Ammanagi\Desktop\gs\YT_GS\assets\team_logo.jpeg")
 GRAPH_SCRIPT = APP_DIR / "deploy_graph.py"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 GRAPH_HOST, GRAPH_PORT = "127.0.0.1", 5555
