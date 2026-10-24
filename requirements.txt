@@ -4,3 +4,5 @@ matplotlib>=3.8
 tkintermapview>=1.29
 Pillow>=10.0
 setuptools>=68
+numpy>=1.25
+reportlab>=4.0
