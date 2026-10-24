@@ -310,6 +310,7 @@ class GroundStation(ctk.CTk):
         overview = self.tabs.add("Overview")
         imu = self.tabs.add("IMU & Kinematics")
         nav = self.tabs.add("GNSS & Environment")
+        self.nav_tab = nav
         recovery = self.tabs.add("Recovery")
         logtab = self.tabs.add("Flight Log")
         anomaly_tab = self.tabs.add("Anomaly Detection")
@@ -321,11 +322,20 @@ class GroundStation(ctk.CTk):
         ], columns=3)
         self._make_card_grid(imu, [(name.replace("_", " "), name) for name in ("ACCEL_X", "ACCEL_Y", "ACCEL_Z", "ACCEL_MAG", "GYRO_X", "GYRO_Y", "GYRO_Z", "MAG_X", "MAG_Y", "MAG_Z", "ROLL", "PITCH", "YAW", "HALL_RPM")], columns=3)
         self._make_card_grid(nav, [(name.replace("_", " "), name) for name in ("GNSS_FIX", "GNSS_SATS", "GNSS_HDOP", "GNSS_GROUND_SPEED", "GNSS_COURSE", "GNSS_LATITUDE", "GNSS_LONGITUDE", "GNSS_ALTITUDE", "LIGHT_LUX", "UV_INDEX", "HUMIDITY")], columns=3)
-        map_frame = ctk.CTkFrame(nav)
-        map_frame.grid(row=4, column=0, columnspan=3, padx=8, pady=8, sticky="nsew")
-        nav.grid_rowconfigure(4, weight=1)
+        self.map_button = ctk.CTkButton(nav, text="Open Map", command=self._toggle_map)
+        self.map_button.grid(row=4, column=0, columnspan=3, padx=8, pady=(8, 2), sticky="ew")
+        map_frame = ctk.CTkFrame(nav, height=300)
+        map_frame.grid(row=5, column=0, columnspan=3, padx=8, pady=(2, 8), sticky="nsew")
+        map_frame.grid_propagate(False)
+        map_frame.grid_remove()
+        nav.grid_rowconfigure(5, weight=0)
         nav.grid_columnconfigure((0, 1, 2), weight=1)
-        self.flight_map = FlightMap(map_frame, height=300)
+        self.map_frame = map_frame
+        self.map_attribution = ctk.CTkLabel(map_frame, text="Map tiles © OpenStreetMap contributors · © CARTO", anchor="e", font=ctk.CTkFont(size=10))
+        self.map_attribution.pack(side="bottom", fill="x", padx=8, pady=(0, 3))
+        self.map_widget_frame = ctk.CTkFrame(map_frame, fg_color="transparent")
+        self.map_widget_frame.pack(fill="both", expand=True)
+        self.flight_map = FlightMap(self.map_widget_frame, height=270)
         self._build_recovery_tab(recovery)
         self.table = ctk.CTkTextbox(logtab, wrap="none")
         self.table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -334,6 +344,41 @@ class GroundStation(ctk.CTk):
         for note in self._startup_notes:
             self._log(note)
         self._open_graph_window()
+
+    def _toggle_map(self):
+        """Expand/collapse the map panel; tile resources start on the first open."""
+        if getattr(self, "_map_animation_id", None) is not None:
+            try: self.after_cancel(self._map_animation_id)
+            except Exception: pass
+            self._map_animation_id = None
+        if getattr(self, "map_visible", False):
+            self.map_visible = False
+            self.map_button.configure(text="Open Map")
+            self.nav_tab.grid_rowconfigure(5, weight=0)
+            self._animate_map(int(self.map_frame.cget("height")), 0, closing=True)
+        else:
+            self.map_visible = True
+            self.map_button.configure(text="Close Map")
+            self.map_frame.grid()
+            self.map_frame.configure(height=1)
+            self.nav_tab.grid_rowconfigure(5, weight=1)
+            self.flight_map.show()
+            self._animate_map(1, 300, closing=False)
+
+    def _animate_map(self, current: int, target: int, closing: bool):
+        step = 24 if target > current else -24
+        next_height = current + step
+        if (step > 0 and next_height >= target) or (step < 0 and next_height <= target):
+            next_height = target
+        self.map_frame.configure(height=max(1, next_height))
+        if next_height != target:
+            self._map_animation_id = self.after(12, self._animate_map, next_height, target, closing)
+        elif closing:
+            self.flight_map.hide()
+            self.map_frame.grid_remove()
+            self._map_animation_id = None
+        else:
+            self._map_animation_id = None
 
     def _make_card_grid(self, parent, entries, columns=3):
         for col in range(columns): parent.grid_columnconfigure(col, weight=1)
@@ -392,7 +437,12 @@ class GroundStation(ctk.CTk):
             self._log(f"SIM > {command}")
             return
         if not self.serial_worker:
-            self._log(f"Command not sent; serial disconnected: {command}")
+            # A disconnected station can still exercise telemetry, graphs, maps,
+            # recovery guidance and Start/Stop controls against local test data.
+            self.sim_switch.select()
+            self._start_simulation()
+            self.simulation_worker.command(command)
+            self._log(f"SIM > {command} (no serial connection)")
             return
         try:
             self.serial_worker.send(command)
@@ -406,20 +456,25 @@ class GroundStation(ctk.CTk):
 
     def _toggle_simulation(self):
         if self.sim_switch.get():
-            if self.serial_worker:
-                self.sim_switch.deselect()
-                self._log("Disable serial connection before simulation")
-                return
-            self.simulation_worker = SimulationWorker(self.inbox)
-            self.simulation_seen = True
-            self.simulation_worker.start()
-            self.connect_button.configure(state="disabled")
-            self._log("Simulation enabled. Use Start Telemetry to generate local frames.")
+            self._start_simulation()
         elif self.simulation_worker:
             self.simulation_worker.stop()
             self.simulation_worker = None
             self.connect_button.configure(state="normal")
             self._log("Simulation disabled")
+
+    def _start_simulation(self):
+        if self.serial_worker:
+            self.sim_switch.deselect()
+            self._log("Disable serial connection before simulation")
+            return
+        if self.simulation_worker:
+            return
+        self.simulation_worker = SimulationWorker(self.inbox)
+        self.simulation_seen = True
+        self.simulation_worker.start()
+        self.connect_button.configure(state="disabled")
+        self._log("Simulation enabled. Use Start Telemetry to generate local frames.")
 
     def _build_recovery_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -445,8 +500,11 @@ class GroundStation(ctk.CTk):
         try:
             result = calculate_navigation_instructions(self.user_lat_entry.get(), self.user_lon_entry.get(), self.heading_entry.get(), *self.landing_coordinates)
             self.recovery_var.set(f"{result['instruction']}\nDistance: {result['distance']:.1f} m  |  Bearing: {result['bearing']:.1f}°")
+            self.flight_map.set_navigation_origin(float(self.user_lat_entry.get()), float(self.user_lon_entry.get()))
+            self.flight_map.set_target_position(*self.landing_coordinates)
         except (ValueError, TypeError) as exc:
             self.recovery_var.set(f"Check your latitude, longitude, and heading: {exc}")
+            self.flight_map.set_navigation_origin(None, None)
 
     def _process_record(self, record: dict):
         raw_record = dict(record)  # untouched wire values for the read-only anomaly detector
@@ -489,12 +547,16 @@ class GroundStation(ctk.CTk):
                     self._update_navigation()
                 else:
                     self.landing_var.set("IMPACT received, but GNSS fix is unavailable; waiting for a valid fix.")
+            fix = int(record["GNSS_FIX"])
+            if fix > 0:
+                target = self.landing_coordinates or (float(record["GNSS_LATITUDE"]), float(record["GNSS_LONGITUDE"]))
+                self.flight_map.set_target_position(*target, redraw=False)
             self.db.submit(record)
             self.broadcaster.publish(record)
             self._run_anomaly_detection(raw_record)
             self._feed_graphs(record)
             self._update_cards(record)
-            self.flight_map.update(float(record["GNSS_LATITUDE"]), float(record["GNSS_LONGITUDE"]), int(record["GNSS_FIX"]))
+            self.flight_map.update(float(record["GNSS_LATITUDE"]), float(record["GNSS_LONGITUDE"]), fix, float(record["GNSS_ALTITUDE"]))
             self._latest_altitude = altitude
         except Exception as exc:
             self._log(f"Frame processing error: {exc}")
