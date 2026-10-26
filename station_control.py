@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 import math
 
@@ -42,6 +43,49 @@ def available_ports() -> list[str]:
         return []
 
 
+def timestamp_to_seconds(value: Any) -> float:
+    """Normalize numeric or date-formatted telemetry time to Unix seconds.
+
+    ISO values retain their timezone offset during conversion. Date strings without
+    a timezone are treated as UTC to avoid host-local timezone differences.
+    """
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("TIMESTAMP is empty")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is not None:
+        if not math.isfinite(seconds):
+            raise ValueError("TIMESTAMP is not finite")
+        return seconds
+
+    iso_value = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    try:
+        parsed = datetime.fromisoformat(iso_value)
+    except ValueError:
+        parsed = None
+        for date_format in (
+            "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
+            "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+            "%m/%d/%Y %H:%M:%S",
+        ):
+            try:
+                parsed = datetime.strptime(raw, date_format)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        raise ValueError(f"unrecognized timestamp format: {raw!r}")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    seconds = parsed.timestamp()
+    if not math.isfinite(seconds):
+        raise ValueError("TIMESTAMP is not finite")
+    return seconds
+
+
 def parse_frame(line: str) -> dict[str, Any]:
     """Parse exactly 37 comma-separated fields and reject malformed frames."""
     cells = [part.strip() for part in line.strip().lstrip("\ufeff").split(",")]
@@ -52,7 +96,11 @@ def parse_frame(line: str) -> dict[str, Any]:
         if not raw:
             raise ValueError(f"{field} is empty")
         try:
-            if field in STRING_FIELDS:
+            if field == "TIMESTAMP":
+                # Preserve the 37-column layout while normalizing both numeric
+                # and ISO/date-string timestamps for every downstream consumer.
+                record[field] = timestamp_to_seconds(raw)
+            elif field in STRING_FIELDS:
                 record[field] = raw
             elif field in INTEGER_FIELDS:
                 number = float(raw)

@@ -23,12 +23,14 @@ from database_handling import TelemetryDatabase
 from environmental_fingerprinting import REQUIRED_COLUMNS, FingerprintResult, analyze_environment, failed_result, format_fingerprint_text
 from environmental_fingerprinting import STATUS_COMPLETE as FP_COMPLETE, STATUS_INSUFFICIENT as FP_INSUFFICIENT  # not the anomaly STATUS_* names
 from setup_map import FlightMap
-from station_control import STATE_NAMES, SerialSettings, TELEMETRY_FIELDS, available_ports, parse_frame
+from station_control import STATE_NAMES, SerialSettings, TELEMETRY_FIELDS, available_ports, parse_frame, timestamp_to_seconds
 from telemetry_graphs import GraphData, TelemetryGraphWindow
 from offline_navigation import calculate_navigation_instructions
 
 APP_DIR = Path(__file__).resolve().parent
-LOGO_PATH = Path(r"C:\Users\Keertana M Ammanagi\Desktop\gs\YT_GS\assets\team_logo.jpeg")
+LOGO_PATH = APP_DIR / "assets" / "team_logo.jpeg"
+if not LOGO_PATH.is_file():
+    LOGO_PATH = APP_DIR / "team_logo.jpeg"
 GRAPH_SCRIPT = APP_DIR / "deploy_graph.py"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 GRAPH_HOST, GRAPH_PORT = "127.0.0.1", 5555
@@ -517,7 +519,8 @@ class GroundStation(ctk.CTk):
             if self.altitude_baseline is None:
                 self.altitude_baseline = float(record["ALTITUDE"])
             record["REL_ALTITUDE"] = float(record["ALTITUDE"]) - self.altitude_baseline
-            timestamp = float(record["TIMESTAMP"])
+            timestamp = timestamp_to_seconds(record["TIMESTAMP"])
+            record["TIMESTAMP"] = timestamp
             altitude = float(record["ALTITUDE"])
             if self.previous_altitude:
                 old_time, old_alt = self.previous_altitude

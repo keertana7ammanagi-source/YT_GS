@@ -15,6 +15,13 @@ DB_PATH = Path(__file__).resolve().with_name("telemetry.sqlite3")
 _SCHEMA = ", ".join(f'"{field}" TEXT' for field in TELEMETRY_FIELDS)
 
 
+def _sqlite_bind_value(value: Any) -> Any:
+    """Keep unusual values bindable; telemetry columns themselves are stored as text."""
+    if value is None or isinstance(value, (str, int, float, bytes)):
+        return value
+    return str(value)
+
+
 class TelemetryDatabase:
     def __init__(self, path: str | Path = DB_PATH, batch_size: int = 25, flush_seconds: float = 0.5):
         self.path = Path(path)
@@ -62,7 +69,7 @@ class TelemetryDatabase:
             if batch and (len(batch) >= self.batch_size or stopping or self._queue.empty()):
                 try:
                     conn.executemany(insert, [tuple(str(row.get(f, "")) for f in TELEMETRY_FIELDS) for row in batch])
-                    conn.executemany(calculated_insert, [(row.get("PACKET_COUNT"), row.get("REL_ALTITUDE"), row.get("VERTICAL_SPEED"), row.get("ACCEL_MAG"), row.get("POWER"), row.get("CURRENT")) for row in batch])
+                    conn.executemany(calculated_insert, [tuple(_sqlite_bind_value(row.get(key)) for key in ("PACKET_COUNT", "REL_ALTITUDE", "VERTICAL_SPEED", "ACCEL_MAG", "POWER", "CURRENT")) for row in batch])
                     conn.commit()
                 except sqlite3.Error as exc:
                     self._error = exc
