@@ -422,7 +422,8 @@ class GroundStation(ctk.CTk):
         self.serial_worker = SerialWorker(settings, self.inbox, self.log_queue)
         self.serial_worker.start()
         self.connect_button.configure(text="Disconnect")
-        self._launch_graph()
+        # The six-graph window (telemetry_graphs.py) opens at start-up. The separate deploy_graph.py window is no longer
+        # launched on connect, so only one sensor-graph window exists. (_launch_graph is kept but unused.)
 
     def _launch_graph(self):
         if self.graph_process and self.graph_process.poll() is None:
@@ -439,12 +440,13 @@ class GroundStation(ctk.CTk):
             self._log(f"SIM > {command}")
             return
         if not self.serial_worker:
-            # A disconnected station can still exercise telemetry, graphs, maps,
-            # recovery guidance and Start/Stop controls against local test data.
-            self.sim_switch.select()
-            self._start_simulation()
-            self.simulation_worker.command(command)
-            self._log(f"SIM > {command} (no serial connection)")
+            # No link: Simulation Mode is never switched on implicitly. The operator must connect the
+            # LoRa/serial port, or turn the Simulation Mode switch on deliberately.
+            self._log(f"NO LINK: '{command}' was not sent (no serial connection, Simulation Mode is off)")
+            messagebox.showwarning(
+                "No link",
+                "There is no link to the CanSat.\n\nConnect the LoRa / serial port first (or switch on Simulation Mode "
+                "yourself if you want local test data).\n\nThe command was not sent.")
             return
         try:
             self.serial_worker.send(command)
@@ -957,3 +959,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

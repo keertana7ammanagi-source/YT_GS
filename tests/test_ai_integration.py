@@ -59,6 +59,9 @@ class AiIntegration(unittest.TestCase):
                               ("altitude_baseline", None), ("flight_started_at", None)):
             setattr(gs, name, default)
         gs.speed_samples = deque(maxlen=3)
+        gs.landing_coordinates = None            # attributes used by the newer _process_record
+        gs.landing_var = mock.MagicMock()
+        gs._update_navigation = mock.MagicMock()
         return gs
 
     def statuses(self, gs):
