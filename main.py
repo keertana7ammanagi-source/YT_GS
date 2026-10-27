@@ -32,6 +32,7 @@ LOGO_PATH = APP_DIR / "assets" / "team_logo.jpeg"
 if not LOGO_PATH.is_file():
     LOGO_PATH = APP_DIR / "team_logo.jpeg"
 GRAPH_SCRIPT = APP_DIR / "deploy_graph.py"
+FLIGHT_LOG_HEADER = "ID | UTC | PACKET | STATE | ALTITUDE | REL_ALT | LATITUDE | LONGITUDE | VOLTAGE | POWER\n"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 GRAPH_HOST, GRAPH_PORT = "127.0.0.1", 5555
 ANOMALY_CONFIG_PATH = APP_DIR / "anomaly_config.json"  # optional; see ANOMALY_DETECTION.md
@@ -244,6 +245,7 @@ class GroundStation(ctk.CTk):
         self._report_running = False
         self._pending_report: dict | None = None
         self.simulation_seen = False                    # set when Simulation Mode is switched on
+        self.flight_log_start_id = 0                    # Flight Log shows rows after this database id, numbered from 1
         self.session_start_id = self._read_session_start_id()
         self.anomaly_detector = self._create_anomaly_detector()
         self._build_ui()
@@ -438,6 +440,7 @@ class GroundStation(ctk.CTk):
         if self.simulation_worker:
             self.simulation_worker.command(command)
             self._log(f"SIM > {command}")
+            self._after_command_sent(command)
             return
         if not self.serial_worker:
             # No link: Simulation Mode is never switched on implicitly. The operator must connect the
@@ -451,12 +454,26 @@ class GroundStation(ctk.CTk):
         try:
             self.serial_worker.send(command)
             self._log(f"TX > {command}")
+            self._after_command_sent(command)
             if command == "CMD,CALIB_1":
                 latest = getattr(self, "_latest_altitude", None)
                 if latest is not None:
                     self.altitude_baseline = latest
         except Exception as exc:
             self._log(f"Command failed: {exc}")
+
+    def _after_command_sent(self, command: str):
+        """Start Telemetry begins a new Flight Log numbering (display only; stored telemetry is never deleted)."""
+        if command != "CMD,START_TM":
+            return
+        try:
+            self.flight_log_start_id = self.db.last_id()
+        except Exception as exc:
+            self._log(f"Flight Log numbering not restarted: {exc}")
+            return
+        self.table.delete("1.0", "end")
+        self.table.insert("end", FLIGHT_LOG_HEADER)
+        self._log("Flight Log restarted from ID 1")
 
     def _toggle_simulation(self):
         if self.sim_switch.get():
@@ -898,12 +915,13 @@ class GroundStation(ctk.CTk):
 
     def _refresh_table(self):
         try:
-            rows = self.db.recent(100)
+            start = self.flight_log_start_id
+            rows = [row for row in self.db.recent(100) if row["id"] > start]
             self.table.delete("1.0", "end")
-            self.table.insert("end", "ID | UTC | PACKET | STATE | ALTITUDE | REL_ALT | LATITUDE | LONGITUDE | VOLTAGE | POWER\n")
+            self.table.insert("end", FLIGHT_LOG_HEADER)
             for row in rows:
                 state = int(row["FLIGHT_SOFTWARE_STATE"])
-                self.table.insert("end", f"{row['id']} | {row['received_utc']} | {row['PACKET_COUNT']} | {STATE_NAMES[state]} | {row['ALTITUDE']} | {row['REL_ALTITUDE']} | {row['GNSS_LATITUDE']} | {row['GNSS_LONGITUDE']} | {row['VOLTAGE']} | {row['POWER']}\n")
+                self.table.insert("end", f"{row['id'] - start} | {row['received_utc']} | {row['PACKET_COUNT']} | {STATE_NAMES[state]} | {row['ALTITUDE']} | {row['REL_ALTITUDE']} | {row['GNSS_LATITUDE']} | {row['GNSS_LONGITUDE']} | {row['VOLTAGE']} | {row['POWER']}\n")
         except Exception as exc:
             self._log(f"Database view error: {exc}")
         self.after(2000, self._refresh_table)
