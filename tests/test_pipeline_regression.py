@@ -112,6 +112,7 @@ class MainHookRegression(unittest.TestCase):
         gs.speed_samples = deque(maxlen=3)
         gs.landing_coordinates = None            # attributes used by the newer _process_record
         gs.landing_var = mock.MagicMock()
+        gs.landing_estimator = mock.MagicMock()
         gs._update_navigation = mock.MagicMock()
         return gs
 
