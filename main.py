@@ -25,13 +25,17 @@ from environmental_fingerprinting import STATUS_COMPLETE as FP_COMPLETE, STATUS_
 from setup_map import FlightMap
 from station_control import STATE_NAMES, SerialSettings, TELEMETRY_FIELDS, available_ports, parse_frame, timestamp_to_seconds
 from telemetry_graphs import GraphData, TelemetryGraphWindow
-from offline_navigation import calculate_navigation_instructions
+from gps_receiver import GpsReceiverWorker
+from offline_navigation import LandingEstimator, calculate_navigation_instructions, format_recovery_text
 
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = APP_DIR / "assets" / "team_logo.jpeg"
 if not LOGO_PATH.is_file():
     LOGO_PATH = APP_DIR / "team_logo.jpeg"
 GRAPH_SCRIPT = APP_DIR / "deploy_graph.py"
+NORMAL_IMPACT_PACKETS, FAST_IMPACT_PACKETS = 60, 12      # Simulation Mode: packets (1 per second) before IMPACT
+GPS_BAUD_RATES = (4800, 9600, 19200, 38400, 57600, 115200)
+GPS_STALE_SECONDS = 5.0
 FLIGHT_LOG_HEADER = "ID | UTC | PACKET | STATE | ALTITUDE | REL_ALT | LATITUDE | LONGITUDE | VOLTAGE | POWER\n"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 GRAPH_HOST, GRAPH_PORT = "127.0.0.1", 5555
@@ -169,11 +173,16 @@ class SerialWorker:
 
 class SimulationWorker:
     """Generate schema-valid synthetic frames locally; never transmits over RF."""
-    def __init__(self, output: queue.Queue):
+    def __init__(self, output: queue.Queue, impact_after: int = NORMAL_IMPACT_PACKETS):
         self.output = output
+        self.impact_after = impact_after
         self.stop_event = threading.Event()
         self.transmitting = threading.Event()
         self.thread = threading.Thread(target=self._run, name="telemetry-simulation", daemon=True)
+
+    def set_fast_impact(self, enabled: bool) -> None:
+        """Fast test mode: IMPACT after ~12 packets instead of ~60 (takes effect immediately)."""
+        self.impact_after = FAST_IMPACT_PACKETS if enabled else NORMAL_IMPACT_PACKETS
 
     def start(self):
         self.thread.start()
@@ -188,20 +197,27 @@ class SimulationWorker:
             if not self.transmitting.is_set():
                 continue
             packet += 1
-            state = 7 if packet >= 60 else (3 if packet >= 10 else 2)
-            values = {
-                "TEAM_ID": "SIM-0001", "TIMESTAMP": f"{time.time():.3f}", "PACKET_COUNT": str(packet),
-                "ALTITUDE": f"{100 + min(packet, 60) * 2:.2f}", "PRESSURE": "100800", "TEMP": "22.5",
-                "VOLTAGE": "7.4", "GNSS_TIME": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "GNSS_LATITUDE": "12.97160", "GNSS_LONGITUDE": "77.59460", "GNSS_ALTITUDE": "920",
-                "GNSS_SATS": "9", "ACCEL_X": "0.1", "ACCEL_Y": "0.2", "ACCEL_Z": "9.7",
-                "GYRO_X": "0.01", "GYRO_Y": "0.02", "GYRO_Z": "0.01", "MAG_X": "20", "MAG_Y": "5", "MAG_Z": "40",
-                "ROLL": "1.2", "PITCH": "-0.8", "YAW": "42", "LIGHT_LUX": "350", "UV_INDEX": "2.1",
-                "HALL_RPM": "0", "FLIGHT_SOFTWARE_STATE": str(state), "REL_ALTITUDE": "0", "VERTICAL_SPEED": "0",
-                "GNSS_GROUND_SPEED": "0", "GNSS_COURSE": "42", "GNSS_HDOP": "0.9", "GNSS_FIX": "2",
-                "HUMIDITY": "45", "CURRENT": "320", "POWER": "2.368",
-            }
-            self.output.put(("frame", ",".join(values[field] for field in TELEMETRY_FIELDS)))
+            self.output.put(("frame", self._build_frame(packet)))
+
+    def _build_frame(self, packet: int) -> str:
+        impact_after = self.impact_after
+        state = 7 if packet >= impact_after else (3 if packet >= (10 if impact_after >= 30 else 4) else 2)
+        # after IMPACT the receiver sits on the ground: a metre or two of GNSS noise (deterministic, ~1-2 m)
+        jitter_lat = 1.2e-5 * math.sin(packet * 1.9) if state == 7 else 0.0
+        jitter_lon = 1.2e-5 * math.cos(packet * 2.7) if state == 7 else 0.0
+        values = {
+            "TEAM_ID": "SIM-0001", "TIMESTAMP": f"{time.time():.3f}", "PACKET_COUNT": str(packet),
+            "ALTITUDE": f"{100 + min(packet, impact_after) * 2:.2f}", "PRESSURE": "100800", "TEMP": "22.5",
+            "VOLTAGE": "7.4", "GNSS_TIME": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "GNSS_LATITUDE": f"{12.97160 + jitter_lat:.6f}", "GNSS_LONGITUDE": f"{77.59460 + jitter_lon:.6f}", "GNSS_ALTITUDE": "920",
+            "GNSS_SATS": "9", "ACCEL_X": "0.1", "ACCEL_Y": "0.2", "ACCEL_Z": "9.7",
+            "GYRO_X": "0.01", "GYRO_Y": "0.02", "GYRO_Z": "0.01", "MAG_X": "20", "MAG_Y": "5", "MAG_Z": "40",
+            "ROLL": "1.2", "PITCH": "-0.8", "YAW": "42", "LIGHT_LUX": "350", "UV_INDEX": "2.1",
+            "HALL_RPM": "0", "FLIGHT_SOFTWARE_STATE": str(state), "REL_ALTITUDE": "0", "VERTICAL_SPEED": "0",
+            "GNSS_GROUND_SPEED": "0", "GNSS_COURSE": "42", "GNSS_HDOP": "0.9", "GNSS_FIX": "2",
+            "HUMIDITY": "45", "CURRENT": "320", "POWER": "2.368",
+        }
+        return ",".join(values[field] for field in TELEMETRY_FIELDS)
 
     def stop(self):
         self.stop_event.set()
@@ -223,6 +239,10 @@ class GroundStation(ctk.CTk):
         self.serial_worker: SerialWorker | None = None
         self.simulation_worker: SimulationWorker | None = None
         self.landing_coordinates: tuple[float, float] | None = None
+        self.landing_estimator = LandingEstimator()      # averages several valid GNSS fixes after IMPACT
+        self.gps_queue: queue.Queue = queue.Queue()
+        self.gps_worker: GpsReceiverWorker | None = None
+        self.gps_last_fix_time: float | None = None
         self.graph_process: subprocess.Popen | None = None
         self.inbox: queue.Queue = queue.Queue(maxsize=2000)
         self.log_queue: queue.Queue = queue.Queue(maxsize=1000)
@@ -255,6 +275,7 @@ class GroundStation(ctk.CTk):
         self.after(1000, self._refresh_ports)
         self.after(1500, self._refresh_table)
         self.after(300, self._poll_ai_queue)
+        self.after(500, self._poll_gps_queue)
 
     def _build_ui(self):
         self.grid_columnconfigure(1, weight=1)
@@ -491,8 +512,10 @@ class GroundStation(ctk.CTk):
             return
         if self.simulation_worker:
             return
-        self.simulation_worker = SimulationWorker(self.inbox)
+        fast = bool(getattr(self, "fast_sim_switch", None) and self.fast_sim_switch.get())
+        self.simulation_worker = SimulationWorker(self.inbox, FAST_IMPACT_PACKETS if fast else NORMAL_IMPACT_PACKETS)
         self.simulation_seen = True
+        self._reset_landing_lock()          # a new simulated run must not reuse an earlier landing lock
         self.simulation_worker.start()
         self.connect_button.configure(state="disabled")
         self._log("Simulation enabled. Use Start Telemetry to generate local frames.")
@@ -502,8 +525,13 @@ class GroundStation(ctk.CTk):
         ctk.CTkLabel(parent, text="CanSat recovery guidance", font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, padx=16, pady=(18, 8), sticky="w")
         self.landing_var = tk.StringVar(value="Landing coordinates are not locked until IMPACT (state 7).")
         ctk.CTkLabel(parent, textvariable=self.landing_var, wraplength=800, justify="left").grid(row=1, column=0, padx=16, pady=8, sticky="w")
+        tools = ctk.CTkFrame(parent, fg_color="transparent")
+        tools.grid(row=2, column=0, padx=16, pady=(0, 4), sticky="ew")
+        ctk.CTkButton(tools, text="Reset landing lock", width=150, command=self._reset_landing_lock).pack(side="left", padx=(0, 12))
+        self.fast_sim_switch = ctk.CTkSwitch(tools, text="Fast IMPACT test (Simulation Mode: ~12 s instead of ~60 s)", command=self._on_fast_sim_toggle)
+        self.fast_sim_switch.pack(side="left")
         inputs = ctk.CTkFrame(parent)
-        inputs.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
+        inputs.grid(row=3, column=0, padx=16, pady=8, sticky="ew")
         self.user_lat_entry = ctk.CTkEntry(inputs, placeholder_text="Your latitude")
         self.user_lon_entry = ctk.CTkEntry(inputs, placeholder_text="Your longitude")
         self.heading_entry = ctk.CTkEntry(inputs, placeholder_text="Heading ° (clockwise from north)")
@@ -511,8 +539,23 @@ class GroundStation(ctk.CTk):
             entry.grid(row=0, column=i, padx=6, pady=8, sticky="ew")
             inputs.grid_columnconfigure(i, weight=1)
         ctk.CTkButton(inputs, text="Get Directions", command=self._update_navigation).grid(row=1, column=0, columnspan=3, padx=6, pady=(0, 8), sticky="ew")
+        gps = ctk.CTkFrame(parent)
+        gps.grid(row=4, column=0, padx=16, pady=4, sticky="ew")
+        ctk.CTkLabel(gps, text="Recovery-team GPS receiver (optional, read-only)").grid(row=0, column=0, columnspan=3, padx=8, pady=(6, 0), sticky="w")
+        self.gps_port_menu = ctk.CTkOptionMenu(gps, values=available_ports() or ["No ports"], width=180)
+        self.gps_port_menu.grid(row=1, column=0, padx=8, pady=6)
+        self.gps_baud_menu = ctk.CTkOptionMenu(gps, values=[str(v) for v in GPS_BAUD_RATES], width=100)
+        self.gps_baud_menu.set("9600")
+        self.gps_baud_menu.grid(row=1, column=1, padx=4, pady=6)
+        self.gps_button = ctk.CTkButton(gps, text="Connect GPS", width=130, command=self._toggle_gps)
+        self.gps_button.grid(row=1, column=2, padx=8, pady=6)
+        self.gps_var = tk.StringVar(value="GPS not connected - enter your position and heading manually.")
+        ctk.CTkLabel(gps, textvariable=self.gps_var, wraplength=760, justify="left").grid(row=2, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="w")
         self.recovery_var = tk.StringVar(value="Enter your position and heading after landing coordinates are available.")
-        ctk.CTkLabel(parent, textvariable=self.recovery_var, font=ctk.CTkFont(size=19, weight="bold"), wraplength=800, justify="left").grid(row=3, column=0, padx=16, pady=16, sticky="w")
+        ctk.CTkLabel(parent, textvariable=self.recovery_var, font=ctk.CTkFont(size=19, weight="bold"), wraplength=800, justify="left").grid(row=5, column=0, padx=16, pady=12, sticky="w")
+        ctk.CTkLabel(parent, text="The landing point is the average of several valid GNSS fixes after IMPACT. GNSS course shows horizontal ground movement only; it does not "
+                                  "show the CanSat's vertical falling direction. A GPS receiver's course is used as your heading only while you are moving.",
+                     wraplength=800, justify="left", text_color=("#52606d", "#9aa6b2")).grid(row=6, column=0, padx=16, pady=(0, 12), sticky="w")
 
     def _update_navigation(self):
         if not self.landing_coordinates:
@@ -520,12 +563,108 @@ class GroundStation(ctk.CTk):
             return
         try:
             result = calculate_navigation_instructions(self.user_lat_entry.get(), self.user_lon_entry.get(), self.heading_entry.get(), *self.landing_coordinates)
-            self.recovery_var.set(f"{result['instruction']}\nDistance: {result['distance']:.1f} m  |  Bearing: {result['bearing']:.1f}°")
+            self.recovery_var.set(format_recovery_text(result))
             self.flight_map.set_navigation_origin(float(self.user_lat_entry.get()), float(self.user_lon_entry.get()))
             self.flight_map.set_target_position(*self.landing_coordinates)
         except (ValueError, TypeError) as exc:
             self.recovery_var.set(f"Check your latitude, longitude, and heading: {exc}")
             self.flight_map.set_navigation_origin(None, None)
+
+    def _collect_impact_fix(self, record: dict):
+        """Feed one post-IMPACT frame to the landing estimator; never lets an error disturb telemetry handling."""
+        try:
+            status = self.landing_estimator.add_fix(record["GNSS_FIX"], record["GNSS_LATITUDE"], record["GNSS_LONGITUDE"], record["GNSS_HDOP"])
+            self.landing_var.set(status.message)
+            if status.locked:
+                self.landing_coordinates = status.coordinates
+                self._log(status.message)
+                self._update_navigation()
+        except Exception as exc:
+            self._log(f"Landing estimator error (telemetry unaffected): {exc}")
+
+    def _reset_landing_lock(self):
+        self.landing_estimator.reset()
+        self.landing_coordinates = None
+        self.landing_var.set("Landing coordinates are not locked until IMPACT (state 7).")
+        self.recovery_var.set("Enter your position and heading after landing coordinates are available.")
+        try:
+            self.flight_map.set_navigation_origin(None, None)
+        except Exception:
+            pass
+
+    def _on_fast_sim_toggle(self):
+        if self.simulation_worker:
+            self.simulation_worker.set_fast_impact(bool(self.fast_sim_switch.get()))
+        self._log("Fast IMPACT test " + ("on (Simulation Mode only)" if self.fast_sim_switch.get() else "off"))
+
+    # ---- optional recovery-team GPS receiver (offline NMEA, read-only)
+    def _toggle_gps(self):
+        if self.gps_worker:
+            self._stop_gps("GPS disconnected - enter your position and heading manually.")
+            return
+        port = self.gps_port_menu.get()
+        if port in ("", "No ports"):
+            messagebox.showerror("GPS receiver", "No serial port selected for the GPS receiver.")
+            return
+        if self.serial_worker and self.serial_worker.settings.port == port:
+            messagebox.showerror("GPS receiver", f"{port} is the telemetry (LoRa) link. Choose the GPS receiver's own port.")
+            return
+        self.gps_worker = GpsReceiverWorker(port, int(self.gps_baud_menu.get()), self.gps_queue)
+        self.gps_worker.start()
+        self.gps_last_fix_time = None
+        self.gps_button.configure(text="Disconnect GPS")
+        self.gps_var.set(f"Opening GPS receiver on {port} - waiting for a valid fix...")
+
+    def _stop_gps(self, message: str):
+        worker, self.gps_worker = self.gps_worker, None
+        if worker:
+            worker.stop()
+        self.gps_last_fix_time = None
+        self.gps_button.configure(text="Connect GPS")
+        self.gps_var.set(message)
+
+    @staticmethod
+    def _set_entry(entry, text: str):
+        entry.delete(0, "end")
+        entry.insert(0, text)
+
+    def _apply_gps_fix(self, fix):
+        self._set_entry(self.user_lat_entry, f"{fix.latitude:.6f}")
+        self._set_entry(self.user_lon_entry, f"{fix.longitude:.6f}")
+        if fix.course_deg is not None:
+            self._set_entry(self.heading_entry, f"{fix.course_deg:.0f}")
+            heading = f"heading {fix.course_deg:.0f}° from GPS course (you are moving)"
+        else:
+            heading = "heading unchanged (GPS course is only used while moving) - keep your manual heading"
+        extras = "".join((f" | HDOP {fix.hdop:.1f}" if fix.hdop is not None else "", f" | {fix.satellites} satellites" if fix.satellites is not None else ""))
+        self.gps_last_fix_time = time.monotonic()
+        self.gps_var.set(f"GPS fix: {fix.latitude:.6f}, {fix.longitude:.6f}{extras}\n{heading}")
+        if self.landing_coordinates:
+            self._update_navigation()
+
+    def _poll_gps_queue(self):
+        try:
+            while True:
+                try:
+                    kind, payload = self.gps_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "gps_fix" and self.gps_worker:
+                    self._apply_gps_fix(payload)
+                elif kind == "gps_status":
+                    self._log(payload)
+                elif kind == "gps_error":
+                    self._log(payload)
+                    self._stop_gps(payload + " - enter your position and heading manually.")
+            if self.gps_worker and self.gps_last_fix_time is not None and time.monotonic() - self.gps_last_fix_time > GPS_STALE_SECONDS:
+                self.gps_var.set(f"No new GPS fix for {time.monotonic() - self.gps_last_fix_time:.0f} s - the position shown is out of date.")
+        except Exception as exc:
+            try: self._log(f"GPS handling error (telemetry unaffected): {exc}")
+            except Exception: pass
+        try:
+            self.after(500, self._poll_gps_queue)
+        except Exception:
+            pass
 
     def _process_record(self, record: dict):
         raw_record = dict(record)  # untouched wire values for the read-only anomaly detector
@@ -563,12 +702,7 @@ class GroundStation(ctk.CTk):
             if self.flight_started_at is None and int(record["FLIGHT_SOFTWARE_STATE"]) >= 2:
                 self.flight_started_at = time.monotonic()
             if int(record["FLIGHT_SOFTWARE_STATE"]) == 7 and self.landing_coordinates is None:
-                if int(record["GNSS_FIX"]) > 0:
-                    self.landing_coordinates = (float(record["GNSS_LATITUDE"]), float(record["GNSS_LONGITUDE"]))
-                    self.landing_var.set(f"IMPACT coordinates locked: {self.landing_coordinates[0]:.6f}, {self.landing_coordinates[1]:.6f}")
-                    self._update_navigation()
-                else:
-                    self.landing_var.set("IMPACT received, but GNSS fix is unavailable; waiting for a valid fix.")
+                self._collect_impact_fix(record)
             fix = int(record["GNSS_FIX"])
             if fix > 0:
                 target = self.landing_coordinates or (float(record["GNSS_LATITUDE"]), float(record["GNSS_LONGITUDE"]))
@@ -963,6 +1097,8 @@ class GroundStation(ctk.CTk):
             self.serial_worker.stop()
         if self.simulation_worker:
             self.simulation_worker.stop()
+        if self.gps_worker:
+            self.gps_worker.stop()
         if self.graph_process and self.graph_process.poll() is None:
             self.graph_process.terminate()
         self.broadcaster.close()
@@ -977,4 +1113,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
     
