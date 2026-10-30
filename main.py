@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -36,9 +36,10 @@ GRAPH_SCRIPT = APP_DIR / "deploy_graph.py"
 NORMAL_IMPACT_PACKETS, FAST_IMPACT_PACKETS = 60, 12      # Simulation Mode: packets (1 per second) before IMPACT
 GPS_BAUD_RATES = (4800, 9600, 19200, 38400, 57600, 115200)
 GPS_STALE_SECONDS = 5.0
-FLIGHT_LOG_HEADER = "ID | UTC | PACKET | STATE | ALTITUDE | REL_ALT | LATITUDE | LONGITUDE | VOLTAGE | POWER\n"
+FLIGHT_LOG_HEADER = "ID | IST | PACKET | STATE | ALTITUDE | REL_ALT | LATITUDE | LONGITUDE | VOLTAGE | POWER\n"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 GRAPH_HOST, GRAPH_PORT = "127.0.0.1", 5555
+IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 ANOMALY_CONFIG_PATH = APP_DIR / "anomaly_config.json"  # optional; see ANOMALY_DETECTION.md
 ANOMALY_STATUS_COLORS = {STATUS_MONITORING: "#2fa572", STATUS_ANOMALY: "#ff9f1a", STATUS_INSUFFICIENT: "#9aa6b2", STATUS_INVALID: "#e5484d"}
 ANOMALY_MAX_LINES = 500
@@ -296,7 +297,7 @@ class GroundStation(ctk.CTk):
         ctk.CTkLabel(header, text="AstrasenseNexus  |  CAN-7USAT Ground Station", image=logo, compound="left", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=18, pady=8, sticky="w")
         self.uptime_var = tk.StringVar(value="Software 00:00:00")
         self.flight_var = tk.StringVar(value="Flight --:--:--")
-        self.clock_var = tk.StringVar(value="UTC --:--:--")
+        self.clock_var = tk.StringVar(value="IST --:--:--")
         for col, var in enumerate((self.uptime_var, self.flight_var, self.clock_var), 1):
             ctk.CTkLabel(header, textvariable=var).grid(row=0, column=col, padx=9)
         self.mode_switch = ctk.CTkSwitch(header, text="Light", command=lambda: ctk.set_appearance_mode("Light" if self.mode_switch.get() else "Dark"))
@@ -1055,7 +1056,11 @@ class GroundStation(ctk.CTk):
             self.table.insert("end", FLIGHT_LOG_HEADER)
             for row in rows:
                 state = int(row["FLIGHT_SOFTWARE_STATE"])
-                self.table.insert("end", f"{row['id'] - start} | {row['received_utc']} | {row['PACKET_COUNT']} | {STATE_NAMES[state]} | {row['ALTITUDE']} | {row['REL_ALTITUDE']} | {row['GNSS_LATITUDE']} | {row['GNSS_LONGITUDE']} | {row['VOLTAGE']} | {row['POWER']}\n")
+                received = datetime.fromisoformat(row["received_utc"].replace("Z", "+00:00"))
+                if received.tzinfo is None:
+                    received = received.replace(tzinfo=timezone.utc)
+                received_ist = received.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
+                self.table.insert("end", f"{row['id'] - start} | {received_ist} | {row['PACKET_COUNT']} | {STATE_NAMES[state]} | {row['ALTITUDE']} | {row['REL_ALTITUDE']} | {row['GNSS_LATITUDE']} | {row['GNSS_LONGITUDE']} | {row['VOLTAGE']} | {row['POWER']}\n")
         except Exception as exc:
             self._log(f"Database view error: {exc}")
         self.after(2000, self._refresh_table)
@@ -1080,11 +1085,11 @@ class GroundStation(ctk.CTk):
             return f"{seconds // 3600:02}:{(seconds // 60) % 60:02}:{seconds % 60:02}"
         self.uptime_var.set("Software " + fmt(time.monotonic() - self.started_at))
         self.flight_var.set("Flight " + (fmt(time.monotonic() - self.flight_started_at) if self.flight_started_at else "--:--:--"))
-        self.clock_var.set("UTC " + datetime.now(timezone.utc).strftime("%H:%M:%S"))
+        self.clock_var.set("IST " + datetime.now(timezone.utc).astimezone(IST).strftime("%H:%M:%S"))
         self.after(250, self._tick_clocks)
 
     def _log(self, message: str):
-        stamp = datetime.now().strftime("%H:%M:%S")
+        stamp = datetime.now(IST).strftime("%H:%M:%S")
         self.log_box.insert("end", f"[{stamp}] {message}\n")
         self.log_box.see("end")
         try:
